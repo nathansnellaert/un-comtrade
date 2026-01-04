@@ -1,0 +1,14 @@
+[project]
+name = "un-comtrade"
+version = "1.0.0"
+requires-python = ">=3.11"
+dependencies = [
+    "psutil>=5.9.0",
+    "httpx",
+    "pyarrow",
+    "boto3",
+    "deltalake>=0.17.0",
+]
+
+[tool.uv]
+dev-dependencies = []
