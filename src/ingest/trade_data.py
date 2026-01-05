@@ -1,71 +1,101 @@
 """Fetch UN Comtrade international trade data.
 
 Uses the UN Comtrade API to fetch bilateral trade flows between countries.
-Free tier limits: 500 records per call (no auth), 100k records per call (with free token).
+Two access tiers:
+- Without API key: Preview endpoint, 500 records per call (unlimited calls/day)
+- With API key: Full endpoint, 100k records per call (500 calls/day)
 
-Note: Bulk download requires premium subscription. This connector uses the free API
-to fetch trade data for major economies.
+Data availability: Annual trade data from 1962 to present for ~200 countries.
+The API uses UN numeric country codes.
 
 API docs: https://comtradedeveloper.un.org/
+Reference data: https://comtradeapi.un.org/files/v1/app/reference/Reporters.json
 """
 import os
 import time
 from subsets_utils import get, save_raw_json, load_state, save_state
 
-BASE_URL = "https://comtradeapi.un.org/data/v1/get/C/A"  # Commodities, Annual
+# API endpoints - C=Commodities, A=Annual, HS=Harmonized System classification
+BASE_URL_PREVIEW = "https://comtradeapi.un.org/public/v1/preview/C/A/HS"  # No key required
+BASE_URL_FULL = "https://comtradeapi.un.org/data/v1/get/C/A/HS"  # Requires key
+REPORTERS_URL = "https://comtradeapi.un.org/files/v1/app/reference/Reporters.json"
 
-# Major reporting economies to fetch (ISO3 codes)
-# These are the largest trading nations
-REPORTERS = [
-    "USA",  # United States
-    "CHN",  # China
-    "DEU",  # Germany
-    "JPN",  # Japan
-    "GBR",  # United Kingdom
-    "FRA",  # France
-    "NLD",  # Netherlands
-    "KOR",  # South Korea
-    "ITA",  # Italy
-    "CAN",  # Canada
-    "MEX",  # Mexico
-    "IND",  # India
-    "BRA",  # Brazil
-    "AUS",  # Australia
-    "SGP",  # Singapore
-]
-
-# Recent years to fetch
-YEARS = list(range(2015, 2025))
+# Years available in UN Comtrade for HS classification
+# HS (Harmonized System) data starts from ~1991, earlier data uses SITC
+# We fetch 1990-present to capture everything available
+YEAR_START = 1990
+YEAR_END = 2024
 
 
-def fetch_trade_data(reporter: str, year: int) -> list[dict]:
-    """Fetch trade data for a single reporter and year."""
-    # Using HS commodity code level 2 (broad categories)
-    # flowCode: M=imports, X=exports
-    url = f"{BASE_URL}/{reporter}/{year}/all/TOTAL"
+def fetch_reporters() -> list[dict]:
+    """Fetch the list of all reporter countries from UN Comtrade."""
+    print("  Fetching reporter list...")
+    response = get(REPORTERS_URL, timeout=60)
+    data = response.json()
+
+    reporters = []
+    for r in data.get("results", []):
+        # Skip expired/historical entities
+        if r.get("entryExpiredDate"):
+            continue
+        # Skip group entities (like EU, ASEAN)
+        if r.get("isGroup"):
+            continue
+        reporters.append({
+            "code": r["reporterCode"],
+            "name": r["reporterDesc"],
+            "iso3": r.get("reporterCodeIsoAlpha3", ""),
+        })
+
+    print(f"    Found {len(reporters)} active reporters")
+    return reporters
+
+
+def fetch_trade_data(reporter_code: int, year: int, retry_count: int = 0) -> list[dict]:
+    """Fetch trade data for a single reporter and year.
+
+    Uses UN numeric reporter code. Fetches all partner countries for this
+    reporter-year combination with TOTAL commodity aggregation (both imports
+    and exports).
+
+    Returns bilateral trade flows: each record is reporter -> partner with
+    trade value, flow direction, and metadata.
+    """
+    api_key = os.environ.get("COMTRADE_API_KEY")
+
+    # Use full endpoint with API key, otherwise preview endpoint
+    if api_key:
+        url = BASE_URL_FULL
+    else:
+        url = BASE_URL_PREVIEW
 
     params = {
+        "reporterCode": str(reporter_code),
+        "period": str(year),
+        "cmdCode": "TOTAL",  # All commodities aggregated
         "includeDesc": "true",
     }
 
-    # Add API key if available
-    api_key = os.environ.get("COMTRADE_API_KEY")
     if api_key:
         params["subscription-key"] = api_key
 
-    try:
-        response = get(url, params=params, timeout=60)
-    except Exception as e:
-        print(f"    Error: {e}")
-        return []
+    response = get(url, params=params, timeout=120)
 
     if response.status_code == 429:
-        print(f"    Rate limited, waiting...")
-        time.sleep(60)
-        return fetch_trade_data(reporter, year)
+        wait_time = min(60 * (2 ** retry_count), 300)  # Exponential backoff, max 5 min
+        print(f"    Rate limited, waiting {wait_time}s...")
+        time.sleep(wait_time)
+        return fetch_trade_data(reporter_code, year, retry_count + 1)
+
+    if response.status_code == 404:
+        # No data for this reporter/year combination
+        return []
 
     if response.status_code != 200:
-        print(f"    HTTP {response.status_code}")
+        print(f"    HTTP {response.status_code}: {response.text[:200]}")
+        if retry_count < 3:
+            time.sleep(10)
+            return fetch_trade_data(reporter_code, year, retry_count + 1)
         return []
 
     data = response.json()
@@ -73,56 +103,76 @@ def fetch_trade_data(reporter: str, year: int) -> list[dict]:
 
 
 def run():
-    """Fetch UN Comtrade trade data for major economies."""
+    """Fetch UN Comtrade trade data for all reporters and years.
+
+    Fetches annual trade data (HS classification, 1990-present) for all active
+    reporter countries. Data is saved per reporter for memory management and
+    incremental updates.
+
+    Rate limiting: ~6 requests/minute to stay within free tier limits.
+    Expected runtime: ~219 reporters × 35 years × 10s = ~21 hours for full crawl.
+    """
     print("Fetching UN Comtrade trade data...")
+
+    # Get list of all active reporters
+    reporters = fetch_reporters()
+    save_raw_json(reporters, "reporters")
 
     state = load_state("comtrade")
     completed = set(state.get("completed", []))
 
+    # Build list of all years
+    years = list(range(YEAR_START, YEAR_END + 1))
+
     # Build list of reporter-year combinations to fetch
-    all_tasks = [(r, y) for r in REPORTERS for y in YEARS]
-    pending = [(r, y) for r, y in all_tasks if f"{r}_{y}" not in completed]
+    all_tasks = [(r["code"], r["name"], y) for r in reporters for y in years]
+    pending = [(code, name, y) for code, name, y in all_tasks if f"{code}_{y}" not in completed]
+
+    total_tasks = len(all_tasks)
+    completed_count = total_tasks - len(pending)
 
     if not pending:
         print("  All trade data up to date")
         return
 
-    print(f"  Fetching {len(pending)} reporter-year combinations...")
+    print(f"  {completed_count:,}/{total_tasks:,} already completed")
+    print(f"  {len(pending):,} reporter-year combinations remaining...")
+    print(f"  Estimated time: ~{len(pending) * 10 / 60:.0f} minutes at 6 req/min")
 
-    all_records = []
-    batch_size = 50  # Save every 50 requests
+    # Process by reporter to save incrementally
+    current_reporter = None
+    reporter_records = []
 
-    for i, (reporter, year) in enumerate(pending, 1):
-        print(f"  [{i}/{len(pending)}] {reporter} {year}...")
+    for i, (reporter_code, reporter_name, year) in enumerate(pending, 1):
+        # Save previous reporter's data when switching to new reporter
+        if current_reporter is not None and reporter_code != current_reporter:
+            if reporter_records:
+                save_raw_json(reporter_records, f"trade_{current_reporter}")
+                print(f"    Saved {len(reporter_records):,} records for reporter {current_reporter}")
+            reporter_records = []
 
-        records = fetch_trade_data(reporter, year)
+        current_reporter = reporter_code
+
+        print(f"  [{i}/{len(pending)}] {reporter_name} ({reporter_code}) {year}...")
+
+        records = fetch_trade_data(reporter_code, year)
 
         if records:
-            # Add metadata to each record
-            for rec in records:
-                rec["_reporter"] = reporter
-                rec["_year"] = year
-            all_records.extend(records)
+            reporter_records.extend(records)
             print(f"    -> {len(records)} records")
         else:
             print(f"    -> no data")
 
-        completed.add(f"{reporter}_{year}")
+        completed.add(f"{reporter_code}_{year}")
         save_state("comtrade", {"completed": list(completed)})
 
-        # Save periodically
-        if len(all_records) >= batch_size * 500:
-            batch_num = len(completed) // batch_size
-            save_raw_json(all_records, f"trade_data_batch_{batch_num}")
-            print(f"    Saved batch {batch_num} ({len(all_records):,} records)")
-            all_records = []
+        # Rate limit: ~6 requests per minute (10s between requests)
+        # Free tier is ~10 req/min, but we're conservative to avoid 429s
+        time.sleep(10)
 
-        # Rate limit
-        time.sleep(1)
-
-    # Save remaining records
-    if all_records:
-        save_raw_json(all_records, "trade_data_final")
-        print(f"  Saved final batch ({len(all_records):,} records)")
+    # Save final reporter's data
+    if reporter_records:
+        save_raw_json(reporter_records, f"trade_{current_reporter}")
+        print(f"    Saved {len(reporter_records):,} records for reporter {current_reporter}")
 
     print("  Done fetching trade data")
