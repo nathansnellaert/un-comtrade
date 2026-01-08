@@ -62,13 +62,16 @@ def upload_file(file_path: str, key: str) -> str:
 
 def download_bytes(key: str) -> Optional[bytes]:
     """Download bytes from R2. Returns None if not found."""
+    from botocore.exceptions import ClientError
     client = get_s3_client()
     bucket = get_bucket_name()
     try:
         response = client.get_object(Bucket=bucket, Key=key)
         return response['Body'].read()
-    except client.exceptions.NoSuchKey:
-        return None
+    except ClientError as e:
+        if e.response.get('Error', {}).get('Code') in ('NoSuchKey', '404', 'NotFound'):
+            return None
+        raise
 
 
 def get_storage_options() -> dict:
@@ -86,3 +89,15 @@ def get_storage_options() -> dict:
 def get_delta_table_uri(dataset_name: str) -> str:
     """Get the S3 URI for a Delta table."""
     return f"s3://{get_bucket_name()}/{get_connector_name()}/data/subsets/{dataset_name}"
+
+
+def list_keys(prefix: str) -> list[str]:
+    """List all keys in R2 with the given prefix."""
+    client = get_s3_client()
+    bucket = get_bucket_name()
+    keys = []
+    paginator = client.get_paginator('list_objects_v2')
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get('Contents', []):
+            keys.append(obj['Key'])
+    return keys

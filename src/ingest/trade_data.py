@@ -51,12 +51,16 @@ def fetch_reporters() -> list[dict]:
     return reporters
 
 
-def fetch_trade_data(reporter_code: int, year: int, retry_count: int = 0) -> list[dict]:
-    """Fetch trade data for a single reporter and year.
+def fetch_trade_data(reporter_code: int, year: int, flow_code: str, retry_count: int = 0) -> list[dict]:
+    """Fetch trade data for a single reporter, year, and flow direction.
 
     Uses UN numeric reporter code. Fetches all partner countries for this
-    reporter-year combination with TOTAL commodity aggregation (both imports
-    and exports).
+    reporter-year-flow combination with TOTAL commodity aggregation.
+
+    Args:
+        reporter_code: UN numeric country code
+        year: Year to fetch
+        flow_code: 'M' for imports, 'X' for exports
 
     Returns bilateral trade flows: each record is reporter -> partner with
     trade value, flow direction, and metadata.
@@ -72,7 +76,8 @@ def fetch_trade_data(reporter_code: int, year: int, retry_count: int = 0) -> lis
     params = {
         "reporterCode": str(reporter_code),
         "period": str(year),
-        "cmdCode": "TOTAL",  # All commodities aggregated
+        "flowCode": flow_code,
+        "cmdCode": "TOTAL",
         "includeDesc": "true",
     }
 
@@ -85,7 +90,7 @@ def fetch_trade_data(reporter_code: int, year: int, retry_count: int = 0) -> lis
         wait_time = min(60 * (2 ** retry_count), 300)  # Exponential backoff, max 5 min
         print(f"    Rate limited, waiting {wait_time}s...")
         time.sleep(wait_time)
-        return fetch_trade_data(reporter_code, year, retry_count + 1)
+        return fetch_trade_data(reporter_code, year, flow_code, retry_count + 1)
 
     if response.status_code == 404:
         # No data for this reporter/year combination
@@ -95,7 +100,7 @@ def fetch_trade_data(reporter_code: int, year: int, retry_count: int = 0) -> lis
         print(f"    HTTP {response.status_code}: {response.text[:200]}")
         if retry_count < 3:
             time.sleep(10)
-            return fetch_trade_data(reporter_code, year, retry_count + 1)
+            return fetch_trade_data(reporter_code, year, flow_code, retry_count + 1)
         return []
 
     data = response.json()
@@ -106,11 +111,11 @@ def run():
     """Fetch UN Comtrade trade data for all reporters and years.
 
     Fetches annual trade data (HS classification, 1990-present) for all active
-    reporter countries. Data is saved per reporter for memory management and
-    incremental updates.
+    reporter countries, both imports (M) and exports (X). Data is saved per
+    reporter for memory management and incremental updates.
 
     Rate limiting: ~6 requests/minute to stay within free tier limits.
-    Expected runtime: ~219 reporters × 35 years × 10s = ~21 hours for full crawl.
+    Expected runtime: ~219 reporters × 35 years × 2 flows × 10s = ~42 hours for full crawl.
     """
     print("Fetching UN Comtrade trade data...")
 
@@ -124,9 +129,21 @@ def run():
     # Build list of all years
     years = list(range(YEAR_START, YEAR_END + 1))
 
-    # Build list of reporter-year combinations to fetch
-    all_tasks = [(r["code"], r["name"], y) for r in reporters for y in years]
-    pending = [(code, name, y) for code, name, y in all_tasks if f"{code}_{y}" not in completed]
+    # Flow codes: M = imports, X = exports
+    flows = [("M", "imports"), ("X", "exports")]
+
+    # Build list of reporter-year-flow combinations to fetch
+    all_tasks = [
+        (r["code"], r["name"], y, f_code, f_name)
+        for r in reporters
+        for y in years
+        for f_code, f_name in flows
+    ]
+    pending = [
+        (code, name, y, f_code, f_name)
+        for code, name, y, f_code, f_name in all_tasks
+        if f"{code}_{y}_{f_code}" not in completed
+    ]
 
     total_tasks = len(all_tasks)
     completed_count = total_tasks - len(pending)
@@ -136,14 +153,14 @@ def run():
         return
 
     print(f"  {completed_count:,}/{total_tasks:,} already completed")
-    print(f"  {len(pending):,} reporter-year combinations remaining...")
+    print(f"  {len(pending):,} reporter-year-flow combinations remaining...")
     print(f"  Estimated time: ~{len(pending) * 10 / 60:.0f} minutes at 6 req/min")
 
     # Process by reporter to save incrementally
     current_reporter = None
     reporter_records = []
 
-    for i, (reporter_code, reporter_name, year) in enumerate(pending, 1):
+    for i, (reporter_code, reporter_name, year, flow_code, flow_name) in enumerate(pending, 1):
         # Save previous reporter's data when switching to new reporter
         if current_reporter is not None and reporter_code != current_reporter:
             if reporter_records:
@@ -153,9 +170,9 @@ def run():
 
         current_reporter = reporter_code
 
-        print(f"  [{i}/{len(pending)}] {reporter_name} ({reporter_code}) {year}...")
+        print(f"  [{i}/{len(pending)}] {reporter_name} ({reporter_code}) {year} {flow_name}...")
 
-        records = fetch_trade_data(reporter_code, year)
+        records = fetch_trade_data(reporter_code, year, flow_code)
 
         if records:
             reporter_records.extend(records)
@@ -163,7 +180,7 @@ def run():
         else:
             print(f"    -> no data")
 
-        completed.add(f"{reporter_code}_{year}")
+        completed.add(f"{reporter_code}_{year}_{flow_code}")
         save_state("comtrade", {"completed": list(completed)})
 
         # Rate limit: ~6 requests per minute (10s between requests)
